@@ -1,0 +1,11 @@
+{
+  "output_format": "JPG",
+  "inject_metadata": false,
+  "phone_model": "iPhone 15 Plus",
+  "inject_timestamp": false,
+  "timestamp_date": "2026-10-11",
+  "timestamp_time": "12:00",
+  "output_dir": null,
+  "window_width": 1200,
+  "window_height": 800
+}
