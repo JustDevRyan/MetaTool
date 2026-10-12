@@ -442,10 +442,10 @@ class MainWindow(QMainWindow):
         self.drop_zone.fileSelected.connect(self._load_input)
         lay.addWidget(self.drop_zone, 1)
 
-        self.paste_btn = QPushButton("Paste from clipboard")
+        self.paste_btn = QPushButton("Paste image")
         self.paste_btn.setMinimumHeight(40)
         self.paste_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.paste_btn.setToolTip("Paste the image / ZIP file from the clipboard in the input")
+        self.paste_btn.setToolTip("Use the image (or image / ZIP file) on the clipboard as the input")
         self.paste_btn.clicked.connect(self._paste_image)
         lay.addWidget(self.paste_btn)
 
@@ -461,7 +461,7 @@ class MainWindow(QMainWindow):
         self.result_view = ResultView()
         self.result_view.message.connect(self.statusBar().showMessage)
         lay.addWidget(self.result_view, 1)
-        lay.addWidget(_muted("Right-click the image to Copy."))
+        lay.addWidget(_muted("Right-click the image and choose Copy."))
         return card
 
     def _build_right_column(self) -> QVBoxLayout:
@@ -534,7 +534,7 @@ class MainWindow(QMainWindow):
         row.addWidget(self.out_edit, 1)
         row.addWidget(browse)
         lay.addLayout(_labeled("Output directory", row))
-        lay.addWidget(_muted("Default: MetaTool/output. You can choose a prefered directory."))
+        lay.addWidget(_muted("Default: <app folder>/output. A folder you choose is remembered."))
         col.addWidget(out)
         self._refresh_out_edit()
 
@@ -543,7 +543,7 @@ class MainWindow(QMainWindow):
 
     # -- settings ----------------------------------------------------------
     def _restore_settings(self) -> None:
-        # Apply saved values, then start persisting changes
+        """Apply saved values, then start persisting changes."""
         cfg = self._settings
         if cfg.output_format in OUTPUT_FORMATS:
             self.format_combo.setCurrentText(cfg.output_format)
@@ -567,7 +567,7 @@ class MainWindow(QMainWindow):
         self.time_edit.timeChanged.connect(self._persist)
 
     def _persist(self) -> None:
-        # Collect the current UI state and write settings.json.
+        """Collect the current UI state and write settings.json."""
         cfg = self._settings
         cfg.output_format = self.format_combo.currentText()
         cfg.inject_metadata = self.inject_chk.isChecked()
@@ -695,8 +695,11 @@ class MainWindow(QMainWindow):
             lines.append("Phone metadata injected.")
         kind = "custom" if self._custom_timestamp else "today's date and time"
         lines.append(f"Timestamp ({kind}): {result.timestamp:%Y-%m-%d %H:%M:%S}")
+        lines.append(self._pixel_status(result))
 
         icon, title = QMessageBox.Icon.Information, "Success"
+        if result.max_error:
+            icon, title = QMessageBox.Icon.Warning, "Saved - not bit-identical"
         if report is not None:
             if report.passed:
                 lines.append(f"✔ Verified: {report.summary()}")
@@ -706,8 +709,25 @@ class MainWindow(QMainWindow):
                 lines.append(f"✘ Verification found {len(report.errors)} problem(s): {problems}")
         box = QMessageBox(icon, title, "\n\n".join(lines), QMessageBox.StandardButton.Ok, self)
         if report is not None:
-            box.setDetailedText(report.text())  # "Show Details…" lists every check
+            box.setDetailedText(report.text() + self._icc_note(result.icc_removed))  # every check
         box.exec()
+
+    @staticmethod
+    def _pixel_status(r: SaveResult) -> str:
+        """One line telling the truth about what encoding did to the pixels."""
+        if r.max_error:
+            return (f"⚠ Pixels: not bit-identical - largest difference {r.max_error}/255 per channel "
+                    "(JPG cannot store this image exactly; HEIC can)")
+        how = ("lossless copy, nothing re-encoded" if r.lossless_copy
+               else "lossless HEIC" if r.path.suffix.lower() == ".heic" else "lossless")
+        if r.pixel_notes:
+            return f"ℹ Pixels: identical after conversion - {'; '.join(r.pixel_notes)}"
+        return f"✔ Pixels: identical to the original ({how})"
+
+    @staticmethod
+    def _icc_note(removed: bool) -> str:
+        return ("\n\nℹ The source's ICC colour profile was removed (as intended); colours can look "
+                "different in colour-managed viewers.") if removed else ""
 
     def _show_result_preview(self, result: SaveResult) -> None:
         """Display the processed (saved) image in the Result card."""
@@ -736,6 +756,14 @@ class MainWindow(QMainWindow):
             first, last = batch.results[0].timestamp, batch.results[-1].timestamp
             kind = "custom start" if self._custom_timestamp else "ending now"
             lines.append(f"Timestamps ({kind}): {first:%Y-%m-%d %H:%M:%S} → {last:%Y-%m-%d %H:%M:%S}, 1 minute apart")
+        if batch.results:
+            exact = sum(1 for r in batch.results if not r.max_error and not r.pixel_notes)
+            worst = max(r.max_error for r in batch.results)
+            if exact == len(batch.results):
+                lines.append(f"✔ Pixels: identical to the originals in all {exact} images")
+            else:
+                lines.append(f"⚠ Pixels: {len(batch.results) - exact} of {len(batch.results)} images are not bit-identical"
+                             + (f" (largest difference {worst}/255)" if worst else " (see the details)"))
         bad = [r for r in batch.results if r.report is not None and not r.report.passed]
         icon, title = QMessageBox.Icon.Information, "Success"
         if bad:
@@ -747,7 +775,8 @@ class MainWindow(QMainWindow):
         if batch.failures and icon == QMessageBox.Icon.Information:
             icon, title = QMessageBox.Icon.Warning, "Saved with some skipped files"
         box = QMessageBox(icon, title, "\n\n".join(lines), QMessageBox.StandardButton.Ok, self)
-        box.setDetailedText(self._batch_details(batch))
+        box.setDetailedText(self._batch_details(batch)
+                            + self._icc_note(any(r.icc_removed for r in batch.results)))
         box.exec()
 
     @staticmethod
@@ -757,6 +786,8 @@ class MainWindow(QMainWindow):
             ok = r.report is not None and r.report.passed
             out.append(f"{'✔' if ok else '✘'} {r.source_name} → {r.path.name} · {r.timestamp:%Y-%m-%d %H:%M:%S}"
                        f" · {r.report.summary() if r.report else 'not verified'}")
+            if r.max_error or r.pixel_notes:
+                out.append("    " + MainWindow._pixel_status(r))
             if r.report is not None:
                 out += [f"    ✘ {c.name} - {c.detail}" for c in r.report.errors]
         if batch.failures:

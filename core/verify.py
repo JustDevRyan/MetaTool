@@ -30,6 +30,7 @@ from .iphone_models import IPHONE_MODELS, MAKE
 
 # EXIF tags the tool writes (the Exif-IFD pointer tag 0x8769 is structural and ignored)
 _TAG_MAKE, _TAG_MODEL, _TAG_SOFTWARE, _TAG_DATETIME, _TAG_DT_ORIGINAL = 271, 272, 305, 306, 36867
+_TAG_ORIENTATION = 274
 _EXIF_IFD_POINTER = 0x8769
 _INFO_NOTE = ("Exposure, lens, MakerNote, GPS, ICC colour profile and thumbnail data that "
               "real iPhone photos carry are not written.")
@@ -44,6 +45,7 @@ class Expected:
     model: str | None
     timestamp: datetime
     leak_tokens: tuple[bytes, ...] = ()  # metadata values of the SOURCE file
+    orientation: int = 1                 # != 1 only for a lossless JPEG copy of a rotated photo
 
 
 @dataclass
@@ -207,9 +209,9 @@ def verify_output(path: str | Path, exp: Expected) -> VerifyReport:
         brand, items, icc = heif_structure(data)
         extras = [t.decode("latin-1") for t in items if t not in (b"hvc1", b"Exif")] + (["ICC profile"] if icc else [])
         add("Container holds exactly one Exif item and no XMP/ICC/IPTC metadata",
-            brand == b"heic" and items.count(b"Exif") == 1 and not extras,
+            brand in (b"heic", b"heix") and items.count(b"Exif") == 1 and not extras,
             f"{items.count(b'Exif')} Exif item(s)" + (f", unexpected: {', '.join(extras)}" if extras else "")
-            + ("" if brand == b"heic" else f", brand {brand!r}"))
+            + ("" if brand in (b"heic", b"heix") else f", brand {brand!r}"))
         raw_exif = info.get("exif")
 
     # 4 + 5 + 6: EXIF content, read back with piexif
@@ -226,6 +228,8 @@ def verify_output(path: str | Path, exp: Expected) -> VerifyReport:
         zeroth = {k: v for k, v in parsed["0th"].items() if k != _EXIF_IFD_POINTER}
         exif_ifd = dict(parsed["Exif"])
         want_zeroth = {_TAG_DATETIME} | ({_TAG_MAKE, _TAG_MODEL, _TAG_SOFTWARE} if exp.model else set())
+        if exp.orientation != 1:  # kept so a rotated photo still displays upright
+            want_zeroth.add(_TAG_ORIENTATION)
         want_exif = {_TAG_DT_ORIGINAL}
 
         problems = []
@@ -235,6 +239,8 @@ def verify_output(path: str | Path, exp: Expected) -> VerifyReport:
             wanted = {_TAG_MAKE: MAKE, _TAG_MODEL: exp.model, _TAG_SOFTWARE: IPHONE_MODELS.get(exp.model, "")}
             problems += [f"{_tag_name('0th', t)} is {_ascii(zeroth.get(t, b''))!r}, expected {v!r}"
                          for t, v in wanted.items() if _ascii(zeroth.get(t, b"")) != v]
+        if exp.orientation != 1 and zeroth.get(_TAG_ORIENTATION) != exp.orientation:
+            problems.append(f"Orientation is {zeroth.get(_TAG_ORIENTATION)!r}, expected {exp.orientation}")
         add("EXIF holds exactly the intended fields and nothing else", not problems,
             f"found {_names('0th', zeroth)}, {_names('Exif', exif_ifd)}"
             + (" | " + "; ".join(problems) if problems else ""))

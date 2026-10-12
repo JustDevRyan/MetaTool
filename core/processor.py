@@ -16,7 +16,7 @@ from pathlib import Path, PurePosixPath
 from typing import Callable
 
 import piexif
-from PIL import Image, ImageOps
+from PIL import Image, ImageChops, ImageOps
 
 from .iphone_models import IPHONE_MODELS, MAKE
 from .verify import Expected, VerifyReport, verify_output
@@ -37,11 +37,20 @@ ZIP_EXTENSION = ".zip"
 # Dropdown label -> (Pillow format name, file extension)
 OUTPUT_FORMATS = {"JPG": ("JPEG", ".jpg"), "HEIC": ("HEIF", ".heic")}
 
-# JPEG chroma subsampling: 0 = 4:4:4 (colours exactly as decoded), 2 = 4:2:0 (what iPhones
-# write). 4:2:0 averages the colour channels over 2x2 pixels, which visibly changes sharp
-# colour edges, so it is left off. Measured on a photo: 99th-percentile colour error
-# (CIE dE) rises from 5 to 11 and the worst pixel from 13 to 40.
-JPEG_SUBSAMPLING = 0
+# NO image-quality compromise is made unless a format makes it unavoidable:
+#   * JPEG source -> JPG: the compressed image data is copied untouched, only the metadata is
+#     replaced (lossless: the decoded pixels are identical, nothing is re-encoded).
+#   * anything -> HEIC: lossless HEVC (4:4:4 chroma, identity colour matrix), bit-exact.
+#   * any other source -> JPG: JPEG cannot store arbitrary pixels exactly, so this uses the
+#     highest setting (quality 100, no chroma subsampling). The error is measured and reported.
+JPEG_QUALITY = 100
+JPEG_SUBSAMPLING = 0  # 4:4:4
+HEIC_LOSSLESS = {  # RGB stored directly (identity matrix, full range): bit-exact round trip
+    "quality": -1,
+    "chroma": 444,
+    "nclx_profile": {"color_primaries": 1, "transfer_characteristics": 13,
+                     "matrix_coefficients": 0, "full_range_flag": 1},
+}
 
 # Allowed range for the user-chosen timestamp
 YEAR_MIN, YEAR_MAX = 2000, 2100
@@ -65,6 +74,10 @@ class SaveResult:
     timestamp: datetime | None = None  # the exact timestamp written
     report: VerifyReport | None = None  # result of the post-save verification
     source_name: str = ""
+    max_error: int = 0  # largest per-channel pixel difference introduced by encoding (0 = identical)
+    lossless_copy: bool = False  # JPEG data copied without re-encoding
+    pixel_notes: list[str] = field(default_factory=list)  # unavoidable changes (transparency, 16-bit...)
+    icc_removed: bool = False  # the source had a colour profile, which is stripped
 
 
 @dataclass
@@ -157,22 +170,31 @@ def collect_source_tokens(src: Source) -> tuple[bytes, ...]:
 
 
 # -- Step 1: convert -----------------------------------------------------------
-def convert_to_rgb(src: Source) -> Image.Image:
+def convert_to_rgb(src: Source) -> tuple[Image.Image, list[str]]:
     """Decode the source (any supported format) into plain 8-bit RGB pixels.
 
-    This is the format-conversion step. Everything JPG and HEIC cannot hold is
-    resolved here: transparency is flattened onto white, palette / grayscale /
-    16-bit modes become RGB, and the EXIF rotation is baked into the pixels so
-    the picture stays upright once the Orientation tag is gone.
+    Returns (image, notes). Notes list the rare cases where pixel values must change
+    because JPG / HEIC cannot hold them: transparency, 16-bit data, CMYK and the like.
+    The EXIF rotation is baked into the pixels so the picture stays upright once the
+    Orientation tag is gone.
     """
+    notes: list[str] = []
     with _open(src) as image:
         img = ImageOps.exif_transpose(image)
-        if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+        mode = img.mode
+        if mode in ("RGBA", "LA", "PA") or (mode == "P" and "transparency" in img.info):
             rgba = img.convert("RGBA")
+            if rgba.getchannel("A").getextrema()[0] < 255:
+                notes.append("transparency was flattened onto white (JPG/HEIC cannot keep it)")
             flat = Image.new("RGB", rgba.size, (255, 255, 255))
             flat.paste(rgba, mask=rgba.getchannel("A"))
-            return flat
-        return img.convert("RGB")
+            return flat, notes
+        if mode.startswith("I") or mode == "F":  # 16 / 32-bit grayscale
+            notes.append("16/32-bit data was scaled down to 8-bit")
+            img = img.point(lambda i: i * (1 / 256)).convert("L") if mode.startswith("I;16") else img.convert("L")
+        elif mode not in ("RGB", "L", "P", "1", "RGBX"):
+            notes.append(f"{mode} colours were converted to RGB")
+        return img.convert("RGB"), notes
 
 
 # -- Step 2: strip -------------------------------------------------------------
@@ -188,14 +210,17 @@ def strip_metadata(img: Image.Image) -> Image.Image:
 
 
 # -- Step 3: inject ------------------------------------------------------------
-def build_exif_bytes(model: str | None, stamp: datetime) -> bytes:
+def build_exif_bytes(model: str | None, stamp: datetime, orientation: int = 1) -> bytes:
     """EXIF block with only the fields we write.
 
     Phone (optional):   Make, Model, Software (the iOS version)
     Timestamp (always): DateTime, DateTimeOriginal
+    Orientation:        only for a lossless JPEG copy of a rotated photo (pixels are not rotated)
     """
     text = stamp.strftime("%Y:%m:%d %H:%M:%S").encode()
     zeroth: dict = {piexif.ImageIFD.DateTime: text}
+    if orientation != 1:
+        zeroth[piexif.ImageIFD.Orientation] = orientation
     if model:
         zeroth[piexif.ImageIFD.Make] = MAKE.encode()
         zeroth[piexif.ImageIFD.Model] = model.encode()
@@ -215,16 +240,117 @@ def strip_jfif(data: bytes) -> bytes:
 
 
 def encode_image(img: Image.Image, fmt: str, exif: bytes) -> bytes:
-    """Encode once, with the EXIF block riding along."""
+    """Encode once at the highest fidelity, with the EXIF block riding along."""
     if fmt == "JPEG":
-        # no optimize=True: its buffer is 2 bytes/pixel at q95, which grainy images can exceed
-        kwargs = {"quality": 100, "subsampling": JPEG_SUBSAMPLING}
-    else:  # HEIC: 8-bit 4:2:0 HEVC, like an iPhone
-        kwargs = {"quality": 100, "chroma": 420}
+        # no optimize=True: its buffer is 2 bytes/pixel, which grainy images can exceed
+        kwargs = {"quality": JPEG_QUALITY, "subsampling": JPEG_SUBSAMPLING}
+    else:
+        kwargs = dict(HEIC_LOSSLESS)
     buf = io.BytesIO()
     img.save(buf, format=fmt, exif=exif, **kwargs)
     data = buf.getvalue()
     return strip_jfif(data) if fmt == "JPEG" else data
+
+
+# -- Lossless JPEG copy: new metadata, same compressed image data ---------------------
+_UNSUPPORTED_SOF = {0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF}
+
+
+def rebuild_jpeg(data: bytes, exif: bytes) -> bytes | None:
+    """The same JPEG with every APPn / COM segment dropped and ``exif`` as the only metadata.
+
+    Quantisation / Huffman tables and all scan data are copied byte for byte, so nothing is
+    re-encoded. Returns None when the file is not a plain 8-bit YCbCr JPEG (grayscale, CMYK,
+    RGB-coded, lossless or arithmetic coding): those fall back to a normal encode.
+    """
+    if data[:2] != b"\xff\xd8" or len(exif) + 2 > 0xFFFF:
+        return None
+    out = [b"\xff\xd8", b"\xff\xe1" + (len(exif) + 2).to_bytes(2, "big") + exif]
+    pos, n = 2, len(data)
+    sof = None
+    adobe_transform = None
+    while pos + 2 <= n:
+        if data[pos] != 0xFF:
+            return None
+        marker = data[pos + 1]
+        if marker == 0xFF:  # fill byte
+            pos += 1
+            continue
+        if marker == 0xD9:  # EOI: anything after it (MPF previews, trailers) is dropped
+            out.append(b"\xff\xd9")
+            break
+        if pos + 4 > n:
+            return None
+        length = int.from_bytes(data[pos + 2:pos + 4], "big")
+        end = pos + 2 + length
+        if length < 2 or end > n:
+            return None
+        payload = data[pos + 4:end]
+        if 0xE0 <= marker <= 0xEF or marker == 0xFE:  # APPn / COM: dropped
+            if marker == 0xEE and payload[:5] == b"Adobe" and len(payload) >= 12:
+                adobe_transform = payload[11]
+            pos = end
+            continue
+        if marker in _UNSUPPORTED_SOF or marker == 0xCC:
+            return None
+        if marker in (0xC0, 0xC1, 0xC2):
+            sof = payload
+        out.append(data[pos:end])
+        pos = end
+        if marker == 0xDA:  # SOS: copy the entropy-coded scan up to the next real marker
+            j = pos
+            while True:
+                k = data.find(b"\xff", j)
+                if k == -1 or k + 1 >= n:
+                    return None
+                nxt = data[k + 1]
+                if nxt == 0x00 or 0xD0 <= nxt <= 0xD7:  # stuffed byte / restart marker
+                    j = k + 2
+                elif nxt == 0xFF:
+                    j = k + 1
+                else:
+                    break
+            out.append(data[pos:k])
+            pos = k
+    else:
+        return None  # ran off the end without an EOI
+    if sof is None or sof[0] != 8 or sof[5] != 3:  # 8-bit, three components only
+        return None
+    if adobe_transform == 0 or tuple(sof[6:15:3]) == (ord("R"), ord("G"), ord("B")):
+        return None  # RGB-coded JPEG: dropping its Adobe marker would change the colours
+    return b"".join(out)
+
+
+def lossless_jpeg_copy(src: Source, model: str | None, stamp: datetime):
+    """(new JPEG bytes, stored size, orientation) for a safe, bit-exact copy, else None."""
+    raw = src if isinstance(src, bytes) else Path(src).read_bytes()
+    if raw[:2] != b"\xff\xd8":
+        return None
+    try:
+        with Image.open(io.BytesIO(raw)) as im:
+            size, orientation = im.size, im.getexif().get(0x0112, 1)
+        orientation = orientation if orientation in range(1, 9) else 1
+        rebuilt = rebuild_jpeg(raw, build_exif_bytes(model, stamp, orientation))
+        if rebuilt is None:
+            return None
+        with Image.open(io.BytesIO(raw)) as a, Image.open(io.BytesIO(rebuilt)) as b:
+            a.load()
+            b.load()  # safety net: refuse the shortcut unless the decoded pixels are identical
+            if (a.size, a.mode) != (b.size, b.mode) or a.tobytes() != b.tobytes():
+                return None
+        return rebuilt, size, orientation
+    except Exception:
+        return None
+
+
+def max_pixel_error(path: Path, reference: Image.Image) -> int:
+    """Largest per-channel difference between a saved image and the pixels that were encoded."""
+    with Image.open(path) as im:
+        out = im.convert("RGB")
+        out.load()
+    if out.size != reference.size:
+        return 255
+    return max(hi for _lo, hi in ImageChops.difference(out, reference).getextrema())
 
 
 _IMG_NAME = re.compile(r"^IMG_(\d{4})\.", re.IGNORECASE)
@@ -283,6 +409,14 @@ def _make_dir(folder: Path) -> Path:
     return folder
 
 
+def _has_icc(src: Source) -> bool:
+    try:
+        with _open(src) as im:
+            return bool(im.info.get("icc_profile"))
+    except Exception:
+        return False
+
+
 def _process(src: Source, out_dir: Path, output_format: str, iphone_model: str | None,
              stamp: datetime, name: str = "") -> SaveResult:
     """convert -> strip -> inject -> save -> verify, for one already-validated source."""
@@ -290,25 +424,46 @@ def _process(src: Source, out_dir: Path, output_format: str, iphone_model: str |
         raise ProcessingError(f"The year must be between {YEAR_MIN} and {YEAR_MAX}.")
     fmt, ext = OUTPUT_FORMATS[output_format]
     leak_tokens = collect_source_tokens(src)        # remembered for the final check
+    icc_removed = _has_icc(src)
+
+    data = None
+    clean = None
+    notes: list[str] = []
+    orientation = 1
+    if fmt == "JPEG":  # a JPEG stays untouched: only its metadata is swapped
+        copy = lossless_jpeg_copy(src, iphone_model, stamp)
+        if copy:
+            data, size, orientation = copy
+    lossless_copy = data is not None
+    if data is None:
+        try:
+            converted, notes = convert_to_rgb(src)  # 1. convert
+        except Exception as exc:
+            raise ProcessingError(f"Failed to read the image:\n{exc}") from exc
+        clean = strip_metadata(converted)           # 2. strip everything
+        size = clean.size
     try:
-        converted = convert_to_rgb(src)             # 1. convert
-    except Exception as exc:
-        raise ProcessingError(f"Failed to read the image:\n{exc}") from exc
-    clean = strip_metadata(converted)               # 2. strip everything
-    try:
-        data = encode_image(clean, fmt, build_exif_bytes(iphone_model, stamp))  # 3. inject
-        target = write_with_ios_name(data, out_dir, ext)                        # 4. save
+        if data is None:
+            data = encode_image(clean, fmt, build_exif_bytes(iphone_model, stamp))  # 3. inject
+        target = write_with_ios_name(data, out_dir, ext)                           # 4. save
     except ProcessingError:
         raise
     except Exception as exc:
         raise ProcessingError(f"Failed to save the image:\n{exc}") from exc
 
+    max_error = 0
+    if clean is not None:  # measure what the encoder did to the pixels
+        try:
+            max_error = max_pixel_error(target, clean)
+        except Exception:
+            max_error = 255
     try:  # 5. re-read the saved file and check it
-        report = verify_output(target, Expected(fmt, clean.size, iphone_model, stamp, leak_tokens))
+        report = verify_output(target, Expected(fmt, size, iphone_model, stamp, leak_tokens, orientation))
     except Exception as exc:  # a bug in the check must never lose the saved image
         report = VerifyReport()
         report.add("Verification could run", False, str(exc))
-    return SaveResult(target, bool(iphone_model), stamp, report, name)
+    return SaveResult(target, bool(iphone_model), stamp, report, name,
+                      max_error, lossless_copy, notes, icc_removed)
 
 
 def process_image(
