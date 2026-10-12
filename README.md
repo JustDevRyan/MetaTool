@@ -37,7 +37,7 @@
 
 ## 🚀 Quick start
 
-- Install to your pc from the installer in the latest [release](/releases)
+- Install to your pc from the installer in the latest [release](/releases) (Recommended)
 ```bash
 Download MetaTool_Setup_vx.x.x.exe
 Run it to install the app
