@@ -5,7 +5,7 @@
 <p align="center">
   <img alt="Python 3.10+" src="https://img.shields.io/badge/python-3.10%2B-5271ff?style=flat-square&logo=python&logoColor=white">
   <img alt="PyQt6" src="https://img.shields.io/badge/UI-PyQt6-41cd52?style=flat-square">
-  <img alt="Windows" src="https://img.shields.io/badge/made%20for-Windows, Linux, MacOS-06B6D4?style=flat-square&logo=windows&logoColor=white">
+  <img alt="Windows" src="https://img.shields.io/badge/made%20for-Windows, Linux, (MacOS soon)-06B6D4?style=flat-square&logo=windows&logoColor=white">
   <img alt="Formats" src="https://img.shields.io/badge/output-JPG%20%7C%20HEIC-a06bff?style=flat-square">
   <img alt="Lossless" src="https://img.shields.io/badge/HEIC-bit--exact-2ea44f?style=flat-square">
 </p>
